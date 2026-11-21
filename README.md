@@ -212,7 +212,7 @@ Every run writes `config.json`, `history.csv`, `final_metrics.json` and a
 @article{liu2026personalised,
   title   = {Personalised Federated Learning under Intermittent Participation:
              A Split-Level Leakage-Free Evaluation of Decoupled Heads},
-  author  = {Liu, Kehao and Zhao, Yulong and Guo, Hongfei},
+  author  = {Liu, Kehao and Guo, Hongfei and Zhao, Yulong},
   journal = {Applied Intelligence},
   year    = {2026}
 }
