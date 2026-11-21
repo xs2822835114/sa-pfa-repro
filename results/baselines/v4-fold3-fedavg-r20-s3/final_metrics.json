@@ -1,0 +1,29 @@
+{
+  "global_metrics": {
+    "acc": 0.38933951332560834,
+    "macro_f1": 0.3937737078646677,
+    "worst_client_f1": 0.13912286398697335,
+    "client_f1_std": 0.1841010005580504
+  },
+  "per_client_global_f1": {
+    "client_0": 0.361295988697329,
+    "client_1": 0.42049239232337826,
+    "client_2": 0.13912286398697335,
+    "client_3": 0.5291322117669424,
+    "client_4": 0.1437465211728475,
+    "client_5": 0.6363324175824175
+  },
+  "per_client_global_acc": {
+    "client_0": 0.35537190082644626,
+    "client_1": 0.4625,
+    "client_2": 0.13986013986013987,
+    "client_3": 0.5803108808290155,
+    "client_4": 0.13636363636363635,
+    "client_5": 0.6052631578947368
+  },
+  "schedule": {
+    "mean_participants": 2.0,
+    "min_participants": 2,
+    "max_participants": 2
+  }
+}

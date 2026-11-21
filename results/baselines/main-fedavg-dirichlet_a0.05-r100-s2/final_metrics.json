@@ -1,0 +1,56 @@
+{
+  "global_metrics": {
+    "acc": 0.47429305912596403,
+    "macro_f1": 0.4019291027158283,
+    "worst_client_f1": 0.3689526847421584,
+    "client_f1_std": 0.019623611708457337
+  },
+  "per_client_global_f1": {
+    "client_0": 0.4295911295911295,
+    "client_1": 0.42069716775599125,
+    "client_2": 0.3689526847421584,
+    "client_3": 0.3991228070175438,
+    "client_4": 0.3964596591324702,
+    "client_5": 0.3935913163079439
+  },
+  "per_client_global_acc": {
+    "client_0": 0.5038167938931297,
+    "client_1": 0.48854961832061067,
+    "client_2": 0.4461538461538462,
+    "client_3": 0.4728682170542636,
+    "client_4": 0.46511627906976744,
+    "client_5": 0.46875
+  },
+  "schedule": {
+    "mean_participants": 6.0,
+    "min_participants": 6,
+    "max_participants": 6
+  },
+  "ref_head_variants": {},
+  "ref_head_meta": {
+    "last_participants": [
+      "client_0",
+      "client_1",
+      "client_2",
+      "client_3",
+      "client_4",
+      "client_5"
+    ],
+    "n_cls": {
+      "client_0": 1,
+      "client_1": 2,
+      "client_2": 1,
+      "client_3": 1,
+      "client_4": 2,
+      "client_5": 3
+    },
+    "n_train": {
+      "client_0": 5,
+      "client_1": 852,
+      "client_2": 43,
+      "client_3": 5,
+      "client_4": 314,
+      "client_5": 5
+    }
+  }
+}
