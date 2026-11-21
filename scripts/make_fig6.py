@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regenerate Fig. 6 with driver labels D1-D6 (the original PDF used D0-D5).
+"""Regenerate Fig. 6 (UAH-DriveSet, ten seeds, drivers D1-D6).
 
 Left: paired difference in worst-client F1 against FedAvg and FedPer at three
 uniform rates (ten seeds; 95% paired t intervals).

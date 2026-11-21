@@ -1,15 +1,16 @@
-"""UCI HAR 无泄漏划分：时间块级 natural + Dirichlet 变体（第四轮修订）。
+"""Leak-free UCI HAR partitions: time-block natural split plus Dirichlet variants.
 
-规则：
-  按文件顺序把同一 (subject, label) 的连续窗口视为一个时间块；
-  块长 n >= 10：前 70% 训练，丢弃 2 个窗口作 gap，其余测试；
-  块长 n < 10：整块丢弃（无法在保留 gap 的前提下同时提供训练与测试窗口）。
+Rules:
+  consecutive windows of the same (subject, label) form one time block (file order);
+  block length n >= 10: first 70% train, 2 windows dropped as a gap, the rest test;
+  block length n < 10: block dropped (too short to provide both train and test windows with a gap).
 
-Dirichlet 变体：训练池按类别用 Dirichlet(α) 重分给 30 个客户端（只修补过小客户端），
-测试集沿用 natural_block 的逐 subject 测试集（每个客户端覆盖 6 类）。
+Dirichlet variants: the training pool is redistributed by class with Dirichlet(alpha) over the 30
+clients (only tiny clients are repaired); the test split is the per-subject natural_block one, so
+every client covers all 6 classes.
 
-产出：
-  partition_har_natural_block.json（校验/重建）
+Outputs (data/processed/HAR/partitions/):
+  partition_har_natural_block.json (also used to verify/rebuild the split)
   partition_har_dirichlet_a0.1.json
   partition_har_dirichlet_a0.05.json
 """
@@ -28,7 +29,7 @@ MIN_TOTAL = 10
 
 
 def blocks(subject, y):
-    """返回 [(subject, label, [idx...]), ...]，按文件顺序。"""
+    """Return [(subject, label, [idx...]), ...] in file order."""
     out, start = [], 0
     for i in range(1, len(y) + 1):
         if i == len(y) or subject[i] != subject[start] or y[i] != y[start]:
@@ -78,7 +79,7 @@ def main():
     print(f"windows={len(y)} train={len(tr_pool)} test={len(te_pool)} "
           f"dropped_short_blocks={dropped} subjects={len(subs)}")
 
-    # natural：客户端 = subject
+    # natural: client = subject
     nat_tr = [sorted(i for i in tr_pool if subject[i] == s) for s in subs]
     nat_te = [sorted(i for i in te_pool if subject[i] == s) for s in subs]
     write("natural_block", nat_tr, nat_te, y)

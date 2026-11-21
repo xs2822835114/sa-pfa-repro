@@ -1,15 +1,16 @@
-"""第 5 周 · T022：Sparse Client（部分参与）调度生成。
+"""Sparse-client (partial participation) schedule generation.
 
-两种模式：
-  uniform      每轮从 K 个客户端中随机抽 ceil(rate*K) 个参与（无放回）
-  availability 每个客户端有自身"在线概率" p_i（默认 p_i = rate，含 1 个总是在线、
-               1 个低活跃客户端），每轮按 Bernoulli(p_i) 采样，至少保留 1 个
-                —— 模拟真实车队里"部分车辆从不掉线、部分车辆很少上线"的场景
+Two modes:
+  uniform      each round draws ceil(rate*K) of the K clients without replacement
+  availability each client has its own online probability p_i (default p_i = rate, with one
+               nearly always online and one rarely), sampled as Bernoulli(p_i) per round with at
+               least one client kept: some vehicles never drop out, others rarely join
 
-产出（research/data/processed/UAH/sparse/）：
-  schedule_{mode}_r{rate}.json   每轮参与客户端列表
-  sparse_summary.csv             每配置：平均参与数 / 最低覆盖客户端 / 覆盖率
-  schedule_heatmap.png           uniform 60% 与 availability 60% 的参与矩阵示意
+Outputs (data/processed/UAH/sparse/):
+  schedule_{mode}_r{rate}.json   participating clients per round
+  sparse_summary.csv             per configuration: mean participants / min and max client
+                                 coverage / number of all-down rounds
+  schedule_heatmap.png           participation matrix for uniform and availability at 60%
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ def uniform_schedule(rate: float, rounds: int, seed: int):
 
 
 def availability_schedule(rate: float, rounds: int, seed: int):
-    """真实感更强：客户端在线概率不均（高活跃 x2，低活跃 x0.5，严格范围裁剪）。"""
+    """More realistic: uneven online probabilities (high activity x2, low activity x0.5, clipped)."""
     rng = np.random.default_rng(seed)
     pattern = np.array([1.0, 1.4, 0.4, 1.2, 0.7, 0.3])
     p = np.clip(pattern * rate, 0.05, 1.0)
@@ -89,7 +90,7 @@ def main():
         ax.imshow(mat.T, aspect="auto", cmap="Greens", vmin=0, vmax=1)
         ax.set_yticks(range(K))
         ax.set_yticklabels([f"c{k}" for k in range(K)])
-        ax.set_title(f"{mode} 60% 参与矩阵（行=客户端, 列=轮次）")
+        ax.set_title(f"{mode} 60% participation matrix (rows=clients, columns=rounds)")
     axes[-1].set_xlabel("round")
     fig.tight_layout()
     fig.savefig(out_dir / "schedule_heatmap.png", dpi=150)

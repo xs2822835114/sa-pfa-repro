@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-W25：客户端规模外推的划分生成（半合成）
+Client-granularity extrapolation partitions (semi-synthetic).
 
-思路：不做新的数据采集，而是在 natural（按驾驶员）划分的基础上，把每个驾驶员的
-行程按轮转方式拆成 m 份，得到 6m 个逻辑客户端。物理数据不变，改变的是**客户端粒度**。
+No new data is collected: starting from the natural (per-driver) partition, each driver's trips
+are split round-robin into m parts, giving 6m logical clients. The physical data is unchanged;
+only the *client granularity* changes.
 
-这在车联网场景中有现实对应：真实车队里"一台车"通常不是"一个驾驶员"，同一司机
-可能轮换多台车、同一台车也可能多人驾驶，因此"一车一客户端"本身就比"一人一客户端"
-粒度更细、单客户端数据更少。
+This has a counterpart in connected-vehicle fleets: one vehicle is rarely one driver, the same
+driver may rotate across vehicles and one vehicle may be shared, so "one vehicle per client" is
+already finer-grained (and each client holds less data) than "one driver per client".
 
-严格边界（须写进论文）：本实验**不增加独立驾驶员的数目**，因此不能用于主张跨驾驶员
-泛化能力的提升；它检验的是结论在客户端粒度变化时是否稳健。
+Scope for the paper: the number of independent drivers does not increase, so these runs cannot
+support claims of better cross-driver generalisation; they test whether the conclusions hold when
+the client granularity changes.
 
-产出：
+Outputs:
   data/processed/UAH/partitions/partition_natural_k12.json
   data/processed/UAH/partitions/partition_natural_k18.json
 """
@@ -43,8 +45,9 @@ for m in (2, 3):
             idx = np.asarray(src[c][split], dtype=int)
             lab = y[idx]
             rng = np.random.default_rng(1000 * m + d + (0 if split == "train" else 77))
-            # 按类别分层：每一类的窗口均匀分给 m 个子客户端，保证 3 类覆盖
-            # （按行程切分会造成大量单类客户端，训练与 F1 均不可比）
+            # stratified by class: the windows of each class are spread evenly over the m
+            # sub-clients so that all 3 classes are covered (splitting by trip would produce
+            # many single-class clients, making training and F1 incomparable)
             for gi in range(m):
                 sel = []
                 for k in np.unique(lab):
@@ -55,7 +58,7 @@ for m in (2, 3):
                 out.setdefault(f"client_{d * m + gi}", {"train": [], "test": []})
                 out[f"client_{d * m + gi}"][split] = take.tolist()
 
-    # 规整编号并检查
+    # renumber clients and check coverage
     out = {f"client_{i}": out[k] for i, k in enumerate(
         sorted(out, key=lambda s: int(s.split("_")[1])))}
     dst = OUTDIR / f"partition_natural_k{6 * m}.json"
@@ -70,5 +73,5 @@ for m in (2, 3):
         if cover < 3:
             bad += 1
         print(f"  {k}: train={len(tr):3d} test={len(v['test']):3d} "
-              f"类别={cls.tolist()} 覆盖={cover}/3")
-    print(f"  类别覆盖不足 3 类的客户端: {bad}/{len(out)}")
+              f"classes={cls.tolist()} cover={cover}/3")
+    print(f"  clients covering fewer than 3 classes: {bad}/{len(out)}")

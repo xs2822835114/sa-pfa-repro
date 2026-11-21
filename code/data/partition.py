@@ -1,20 +1,22 @@
-"""第 5 周 · T020/T021：客户端划分与 Non-IID 构造（第四轮修订：无泄漏划分）。
+"""Client partitions and Non-IID construction for UAH-DriveSet (leak-free splits).
 
-第四轮修订（外部评审）：原实现在 50% 重叠窗口池上随机分 train/test，同一段原始
-信号的相邻窗口会跨集，构成行程级泄漏。现改为**行程级**划分，再做客户端划分：
+Splits are trip-level: neighbouring windows of the same raw signal must not land on both
+sides, which random splitting over a 50%-overlapping window pool would allow.
 
-  1. 每个 (司机, 类别) 的最后一个行程 → test；只有一个行程的类别按时序 70/30 切，
-     中间留 GAP=2 个窗口（同司机同类别内 train/test 不重叠）。
-  2. natural     客户端 = 司机，直接使用上面的 train/test。
-  3. iid         训练池按类别均匀分给 K 个客户端；测试池按类别均匀分给 K 个
-                 客户端（各客户端测试分布一致，macro-F1 对每个客户端都有定义）。
-  4. dirichlet_aX 训练池按类别用 Dirichlet(α) 分给 K 个客户端（保留严酷偏斜，
-                 仅修补 < min_total 的客户端）；测试划分同 iid。
+  1. For each (driver, class) the last trip goes to test; classes with a single trip are cut
+     chronologically 70/30 with a GAP=2 window buffer (train and test never overlap).
+  2. natural      client = driver, using those trip-level splits.
+  3. iid          the training pool is split evenly by class over K clients; the test pool is
+                  split the same way (identical class distribution per client, so macro-F1 is
+                  defined for every client).
+  4. dirichlet_aX the training pool is split by class with Dirichlet(alpha) over K clients
+                  (severe skew preserved; only clients below MIN_TOTAL are repaired); the test
+                  split is the iid one.
 
-产出（research/data/processed/UAH/partitions/）：
-  partition_<config>.json   每客户端 {"train": [...idx], "test": [...idx]}
-  partition_stats.csv       每配置每客户端的类别计数（Non-IID 证据表）
-  partition_overview.png    6 个配置 x 6 客户端的类别堆叠柱状图
+Outputs (data/processed/UAH/partitions/):
+  partition_<config>.json   per client {"train": [...idx], "test": [...idx]}
+  partition_stats.csv       per-configuration, per-client class counts (Non-IID evidence)
+  partition_overview.png    stacked class bars for 6 configurations x 6 clients
 """
 from __future__ import annotations
 
@@ -39,19 +41,20 @@ plt.rcParams["font.sans-serif"] = ["Songti SC", "Heiti SC", "Arial Unicode MS", 
 plt.rcParams["axes.unicode_minus"] = False
 
 LABEL_NAMES = ["Normal", "Drowsy", "Aggressive"]
-K = 6            # 客户端数量（UAH: 6 名司机）
+K = 6            # number of clients (UAH: 6 drivers)
 SEED = 42
-GAP = 2          # 单行程切分时丢弃的窗口数（防止相邻窗口跨集）
-MIN_TOTAL = 5    # Dirichlet 客户端的最少训练样本（不足则从最大客户端转移）
+GAP = 2          # windows dropped between train and test when a single-trip class is cut
+MIN_TOTAL = 5    # minimum training samples per Dirichlet client (topped up from the largest client)
 
 
 def trip_pool(y, driver, trip, road, seed: int = SEED, folds: int = 2):
-    """行程级 train/test（无泄漏），返回 {fold: (train_idx, test_idx)}。
+    """Trip-level train/test split (leak-free), returns {fold: (train_idx, test_idx)}.
 
-    留一行程时按道路类型分层：优先留出"同类型还有第二个行程"的行程，使训练集仍覆盖
-    该道路类型。fold 1 与旧结果完全一致（同一个 rng 序列、同一个选择）；fold 2 留出
-    同类别中另一个候选行程（两行程类别即另一个行程），用于检验单次留出的偶然性。
-    单行程类别按时序 70/30 切，各 fold 相同（该类别没有第二个行程可留）。
+    The held-out trip is stratified by road type: trips whose road type has a second trip are
+    preferred, so the training set still covers that road type. Fold 1 reproduces the earlier
+    results exactly (same rng sequence, same draw); fold 2 holds out another candidate trip of
+    the same class, to test whether a single held-out trip was a lucky draw. Single-trip classes
+    are cut chronologically 70/30 in every fold (there is no second trip to hold out).
     """
     rng = np.random.default_rng(seed)
     tr = {k: [] for k in range(1, folds + 1)}
@@ -85,7 +88,7 @@ def trip_pool(y, driver, trip, road, seed: int = SEED, folds: int = 2):
 
 
 def split_even(idxs, y, k: int, rng):
-    """按类别把 idxs 均匀分给 k 个客户端。"""
+    """Split idxs evenly by class over k clients."""
     out = [[] for _ in range(k)]
     for c in np.unique(y[idxs]):
         ii = idxs[y[idxs] == c].copy()
@@ -96,7 +99,8 @@ def split_even(idxs, y, k: int, rng):
 
 
 def split_dirichlet(idxs, y, k: int, alpha: float, rng):
-    """按类别用 Dirichlet(α) 分给 k 个客户端；只修补过小客户端，保留偏斜。"""
+    """Split idxs by class with Dirichlet(alpha) over k clients; only tiny clients are repaired,
+    the skew is kept."""
     out = [[] for _ in range(k)]
     for c in np.unique(y[idxs]):
         ii = idxs[y[idxs] == c].copy()
@@ -128,7 +132,7 @@ def main():
     assert not (set(tr_pool) & set(te_pool))
     tr_arr, te_arr = np.asarray(tr_pool), np.asarray(te_pool)
 
-    # 客户端方案：("natural" | "even" | "dirichlet", alpha)
+    # client configurations: ("natural" | "even" | "dirichlet", alpha)
     configs = {
         "natural": ("natural", None),
         "iid": ("even", None),
@@ -178,7 +182,7 @@ def main():
         ax.set_ylim(0, 1)
         if ax is axes.ravel()[0]:
             ax.legend(loc="lower right", fontsize=8)
-    fig.suptitle(f"UAH 客户端划分对比（窗口 L={args.window}s，训练集标签比例，行程级无泄漏）")
+    fig.suptitle(f"UAH client partitions (window L={args.window}s, training-label share, trip-level split)")
     fig.tight_layout()
     fig.savefig(out_dir / "partition_overview.png", dpi=150)
 
@@ -186,7 +190,7 @@ def main():
         w = csv.writer(f)
         w.writerows(stats_rows)
 
-    # 第二、三折（另一个/第三个留出行程），仅用于稳健性检验
+    # folds 2 and 3 (a different held-out trip), for robustness checks only
     drivers = sorted(set(driver.tolist()))
     for k in (2, 3):
         trk, tek = folds[k]

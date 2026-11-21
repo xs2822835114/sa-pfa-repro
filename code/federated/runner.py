@@ -1,34 +1,17 @@
-"""第 7-8 周 · T010/T012/T014：六种算法的统一实验接口（Local / FedAvg / FedProx / FedPer / pFedMe / Ditto）。
-第 11 周 · T043：新增 proposed（SA-PFA，实现见 research/code/federated/proposed.py）。
+"""Unified experiment driver for the federated baselines and SA-PFA.
 
-算法要点（与文献一一对应）：
-  local   各客户端只在本地数据上训练（无通信；个人化下界/上界参照）
-  fedavg  w ← Σ (n_i/Σn_j)·w_i（全部参数聚合）
-  fedprox 本地目标 L_i(w) + (μ/2)‖w−w^t‖²（flcore.train_local 的 prox_mu）
-  fedper  共享 base + 本地个性化头：只聚合 base 参数，头部留在客户端（提高最差客户端）
-  pfedme  Moreau envelope 近似：内层 θ_i=argmin L_i(θ)+(λ/2)‖θ−w‖²；外层伪梯度 g_i=λ(w−θ_i)，
-          w ← w − η·Σ(n_i/Σn)·g_i（个性化模型即 θ_i）
-  ditto   每轮先 FedAvg 得全局 w，再各客户端以 w 为锚点更新个性化模型 θ_i（L_i(θ)+(λ/2)‖θ−w‖²）
-  proposed SA-PFA：A/Q/C 客户端评估驱动的稀疏感知聚合（权重下限 ω + 时间平滑 η）
-           + 共享 backbone 的 prox 约束（μ）+ 本地个性化头；用 D_val 上的损失下降衡量贡献 C
+One run trains a single algorithm for a fixed number of rounds on one partition and writes
+history.csv, config.json, final_metrics.json, curves.png and model_final.pt (plus pers_final.pt
+for personalised methods) to results/baselines/<exp_id>/; the run is also appended to
+results/experiment_records.csv. Features and partition JSONs are read from data/processed/.
 
-统一接口与统一评估（便于第 9 周分析）：
-  - 每个 run 产出 research/results/baselines/<exp_id>/{history.csv, config.json, final_metrics.json,
-    curves.png, model_final.pt[, pers_final.pt]}
-  - global 协议：共享/全局模型在每个客户端 test 上的 Acc/Macro-F1 → mean/std/worst
-  - personalized 协议（fedper/pfedme/ditto）：客户端用各自个性化模型评估
-  - 实验记录统一写入 research/results/experiment_records.csv
+Two protocols are reported: global (the shared model scored on every client's test split, with
+mean/std/worst over clients) and personalized (each client scored with its own model). The
+participation schedule is generated on the fly from --seed.
 
-评估协议修正（第 11 周，修 week9 bug）：fedper / proposed 的"全局协议"此前会用**从未更新的头**评估，
-现改为使用"参考全局头" = 本轮参与者个性化头的平均（仅用于评估/报告，不参与聚合）。
-
-稀疏调度（第 11 周修正）：参与集合按 --seed 现场生成（uniform / availability），
-使 3 个 seed 同时覆盖"初始化 + 参与模式"两类随机性。
-
-用法示例：
-  python code/federated/runner.py \
-      --algo fedprox --partition dirichlet_a0.1 --rate 0.6 --rounds 40 \
-      --exp-id bl-fedprox-dirichlet_a0.1-r60
+Example:
+  python code/federated/runner.py --algo fedprox --partition dirichlet_a0.1 \\
+      --rate 0.6 --rounds 40 --exp-id bl-fedprox-dirichlet_a0.1-r60
 """
 from __future__ import annotations
 
@@ -69,8 +52,8 @@ NON_IID_DESC = {
     "dirichlet_a1.0": "Mild(a=1.0)", "dirichlet_a0.5": "Medium(a=0.5)",
     "dirichlet_a0.1": "Severe(a=0.1)", "dirichlet_a0.05": "Extreme(a=0.05)",
 }
-HEAD_PREFIX = "net.5."   # MLP 最后一层 = 个性化头；其余 = 共享 base
-N_CLASSES = 3            # UAH 三分类；HAR 外部检查时置 6
+HEAD_PREFIX = "net.5."   # last MLP layer = personalised head; the rest = shared base
+N_CLASSES = 3            # UAH has 3 classes; set to 6 for the HAR/WISDM checks
 
 
 def head_keys(state):
@@ -86,26 +69,30 @@ def subset(state, keys):
 
 
 def online_probs(rate, n_clients):
-    """每客户端的稳态在线概率（1 个几乎总在线、1 个低活跃），由 rate 缩放。"""
+    """Steady-state online probability per client (one nearly always online, one rarely),
+    scaled by rate."""
     pattern = np.array([1.0, 1.4, 0.4, 1.2, 0.7, 0.3])
-    # 客户端数超过模式长度时循环扩展（W25：规模外推实验需 K>6）
+    # tile the pattern when K exceeds its length (scaled client-count experiments need K>6)
     pat = pattern[:n_clients] if n_clients <= pattern.size else np.resize(pattern, n_clients)
     return np.clip(pat * rate, 0.05, 1.0)
 
 
 def make_schedule(mode, rate, rounds, seed, n_clients=6, allow_empty=False, dwell=8):
-    """现场生成参与调度（与 data/sparse.py 的语义一致，但按 seed 变化）。
+    """Build the participation schedule on the fly (same semantics as code/data/sparse.py,
+    but seeded here).
 
-    uniform      每轮随机抽 ⌈rate·K⌉ 个客户端（无放回）
-    availability 每客户端有不同在线概率（1 个几乎总在线、1 个低活跃），按 Bernoulli 采样
-    markov       同一组在线概率，但每客户端为两状态 Markov 链：平均在线时长 dwell 轮，
-                 平均离线时长 dwell·(1-p)/p（P0-2/P1-1：相关可用性，R2.2/R3.3）
-    shift        同一组在线概率，每 dwell 轮为一个班次：班次开始时按 Bernoulli 决定
-                 该客户端整段是否在线（块状相关可用性）
+    uniform      draw ceil(rate*K) clients per round (without replacement)
+    availability each client has its own online probability (one nearly always online,
+                 one rarely); independent Bernoulli sampling per round
+    markov       same online probabilities, but each client follows a two-state Markov
+                 chain: mean online dwell rounds, mean offline dwell*(1-p)/p
+    shift        same online probabilities, one shift every dwell rounds: at the start of
+                 a block the client is online for the whole block with probability p
 
-    allow_empty  仅对 availability/markov/shift 生效。False（默认，与既有实验一致）：
-                 某轮无人上线时保底抽取 1 个客户端，保证训练连续。True：允许空轮，
-                 该轮不聚合，用于把「参与稀疏」与「保底单客户端轮换」两种效应分开。
+    allow_empty  applies to availability/markov/shift only. False (default, as in the
+                 existing experiments): if no client is online, draw one so training never
+                 stalls. True: keep the empty round (no aggregation) so that "sparse
+                 participation" and "forced single-client rotation" can be separated.
     """
     rng = np.random.default_rng(seed)
     if mode == "uniform":
@@ -121,7 +108,7 @@ def make_schedule(mode, rate, rounds, seed, n_clients=6, allow_empty=False, dwel
         out[t] = sorted(part.tolist())
 
     if mode == "markov":
-        # 两状态链：on->off = 1/dwell，off->on = p/(dwell(1-p))，稳态为 p
+        # two-state chain: on->off = 1/dwell, off->on = p/(dwell(1-p)), stationary p
         beta = np.where(p < 1.0, 1.0 / dwell, 0.0)
         alpha = np.where(p < 1.0, p * beta / np.maximum(1.0 - p, 1e-9), 0.0)
         on = rng.random(n_clients) < p
@@ -151,7 +138,7 @@ def evaluate_model(model, X, y):
 
 
 def per_client_metrics(model, client_test):
-    """global 协议：共享模型在每个客户端 test 上的 F1。"""
+    """Global protocol: F1 of the shared model on each client's test split."""
     f1s, accs = {}, {}
     for c, (X, y) in client_test.items():
         acc, f1 = evaluate_model(model, X, y)
@@ -173,7 +160,8 @@ def agg_stats(f1s):
 
 
 def ref_mean_head(heads, participants, ref_state, clients):
-    """参与者个性化头的平均（参考全局头，仅用于 fedper/proposed 的 global 协议评估）。"""
+    """Mean of the participants' personalised heads (reference global head; used only for
+    the global-protocol evaluation of fedper/proposed)."""
     out = OrderedDict()
     keys = [k for k in ref_state.keys() if k.startswith(HEAD_PREFIX)]
     for k in keys:
@@ -183,7 +171,8 @@ def ref_mean_head(heads, participants, ref_state, clients):
 
 
 def ref_weighted_head(heads, entries, alpha, ref_state, clients):
-    """按同一组 α 加权的参考全局头（proposed 用；仅评估/下一轮初始化，不参与共享层聚合）。"""
+    """Reference global head weighted by the same alpha (proposed; used for evaluation and
+    as the next-round initialisation, never inside the shared-layer aggregation)."""
     out = OrderedDict()
     keys = [k for k in ref_state.keys() if k.startswith(HEAD_PREFIX)]
     for k in keys:
@@ -196,7 +185,8 @@ def ref_weighted_head(heads, entries, alpha, ref_state, clients):
 
 
 def macro_f1_from_preds(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 3) -> float:
-    """与 flcore.evaluate 同式的 macro-F1（用于预测级集成这类非参数模型输出）。"""
+    """Macro-F1 computed exactly as in flcore.evaluate (for non-parametric outputs such as
+    prediction-level ensembles)."""
     cm = np.zeros((n_classes, n_classes), dtype=np.int64)
     np.add.at(cm, (y_true, y_pred), 1)
     tp = np.diag(cm).astype(float)
@@ -211,12 +201,16 @@ def macro_f1_from_preds(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int =
 def ref_head_rule_variants(base_state, heads, participants, clients, client_test, val_xy,
                            n_cls=None, n_train=None, n_min=32.0, min_classes=2, calib_steps=300,
                            calib_lr=1e-2, seed=0, n_classes=3, in_dim=47):
-    """W15 T050：同一共享骨干下，四种"参考头规则"的共享交付物质量（评估侧，不改训练）。
+    """Quality of the shared deliverable under four reference-head rules on the same shared
+    backbone (evaluation side only; training is untouched).
 
-    mean     参与者个性化头的均匀平均（现行默认口径）
-    gate     剔除支持度退化参与者（n_i < n_min 或本地类别数 < min_classes）后的均匀平均
-    ensemble 参与者"骨干+各自头"的预测级多数投票（无 heads 时跳过；服务器需持有各头，仅作上界参考）
-    calib    在服务器侧 D_val 上重拟合头（冻结骨干）：无 heads 时同样适用（FedAvg 的公平对照）
+    mean     uniform average of the participants' personalised heads (current default)
+    gate     uniform average after dropping support-degraded participants (n_i < n_min or
+             fewer than min_classes local training classes)
+    ensemble prediction-level majority vote of "shared backbone + own head" per participant
+             (skipped without heads; the server must hold every head, upper bound only)
+    calib    refit the head on the server-side D_val with the backbone frozen (also applies
+             without heads; a fair control for FedAvg)
     """
     import torch.nn.functional as F
     head_ks = [k for k in base_state.keys() if k.startswith(HEAD_PREFIX)]
@@ -250,7 +244,7 @@ def ref_head_rule_variants(base_state, heads, participants, clients, client_test
         keep = [p for p in parts if int(p) not in set(gated)] or parts
         out["gate"] = eval_state({**base_state, **ref_mean_head(heads, keep, base_state, clients)})
         out["gate"]["excluded"] = sorted(clients[int(p)] for p in gated)
-        # 预测级集成：每个参与者把自己的头接在共享骨干上投一票
+        # prediction-level ensemble: every participant votes with its own head on the shared backbone
         preds = []
         for p in parts:
             m = mk({**base_state, **{k: heads[clients[int(p)]][k] for k in head_ks}})
@@ -297,74 +291,86 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--algo", required=True, choices=ALGOS)
     ap.add_argument("--dataset", default="uah", choices=["uah", "har", "wisdm"],
-                    help="uah=UAH-DriveSet 三分类；har=UCI HAR 六分类外部检查")
+                    help="uah=UAH-DriveSet 3-class; har=UCI HAR and wisdm=WISDM 6-class external checks")
     ap.add_argument("--window", type=int, default=30, choices=[10, 30, 60])
     ap.add_argument("--partition", default="iid")
     ap.add_argument("--rate", type=float, default=1.0)
     ap.add_argument("--mode", default="uniform", choices=["uniform", "availability", "markov", "shift"])
     ap.add_argument("--dwell", type=int, default=8,
-                    help="markov/shift 的平均在线时长（轮）")
+                    help="mean online dwell (rounds) for markov/shift")
     ap.add_argument("--rounds", type=int, default=40)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--local-epochs", type=int, default=1)
-    ap.add_argument("--inner-epochs", type=int, default=3, help="pfedme 内层迭代数")
-    ap.add_argument("--outer-lr", type=float, default=0.3, help="pfedme 外层步长 η（伪梯度 λ(w−θ) 的量纲与 η 匹配）")
+    ap.add_argument("--inner-epochs", type=int, default=3, help="number of pfedme inner iterations")
+    ap.add_argument("--outer-lr", type=float, default=0.3,
+                    help="pfedme outer step size eta (the pseudo-gradient lam(w-theta) has the same scale as eta)")
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--mu", type=float, default=0.01, help="FedProx 的 μ")
-    ap.add_argument("--lam", type=float, default=1.0, help="pfedme/ditto 的 λ")
+    ap.add_argument("--mu", type=float, default=0.01, help="FedProx mu")
+    ap.add_argument("--lam", type=float, default=1.0, help="pfedme/ditto lambda")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--exp-id", default=None)
-    # ---- SA-PFA（proposed）超参；默认值在 T044 验收后冻结，见 week12 记录 ----
+    # ---- SA-PFA (proposed) hyperparameters; defaults frozen after the ablation sweep ----
     ap.add_argument("--val-frac", type=float, default=0.0,
-                    help="从每个客户端训练集中划出的共享验证集 D_val 比例（>0 时所有算法同一协议）")
+                    help="fraction of each client's training split held out as the shared validation set D_val "
+                         "(>0 gives every algorithm the same protocol)")
     ap.add_argument("--val-noise-rate", type=float, default=0.0,
-                    help="服务器 D_val 标签对称噪声率（0=关闭；仅 val-frac>0 时生效；W16 T053-b）")
-    ap.add_argument("--omega", type=float, default=0.4, help="SA-PFA 权重下限 ω（第 12 周扫描后冻结=0.4）")
+                    help="symmetric label-noise rate on the server-side D_val (0=off; only active with val-frac>0)")
+    ap.add_argument("--omega", type=float, default=0.4, help="SA-PFA weight floor omega (frozen at 0.4)")
     ap.add_argument("--no-c", action="store_true",
-                    help="移除贡献项 C：不划 D_val、不评估候选完整模型，C≡1（第四轮修订）")
-    ap.add_argument("--mu-sa", type=float, default=0.1, help="SA-PFA 共享层 prox 强度（第 12 周扫描后冻结=0.1）")
-    ap.add_argument("--eta", type=float, default=0.6, help="SA-PFA 权重时间平滑 η")
+                    help="drop the contribution term C: no D_val split, no candidate full-model evaluation, C=1")
+    ap.add_argument("--mu-sa", type=float, default=0.1, help="SA-PFA prox strength on the shared layers (frozen at 0.1)")
+    ap.add_argument("--eta", type=float, default=0.6, help="SA-PFA temporal smoothing eta")
     ap.add_argument("--a-exp", type=float, default=1.0)
     ap.add_argument("--b-exp", type=float, default=1.0)
     ap.add_argument("--c-exp", type=float, default=1.0)
-    ap.add_argument("--d-exp", type=float, default=1.0, help="样本量指数 d（=1 时 A=Q=C=1 退化为 FedAvg）")
-    ap.add_argument("--a-lam", type=float, default=0.8, help="活跃度 EWMA λ")
-    ap.add_argument("--a-T", type=float, default=5.0, help="活跃度新鲜度时间常数 T")
-    ap.add_argument("--gamma-a", type=float, default=0.5, help="活跃度合成权重 γ")
+    ap.add_argument("--d-exp", type=float, default=1.0,
+                    help="sample-size exponent d (with A=Q=C=1 it degenerates to FedAvg)")
+    ap.add_argument("--a-lam", type=float, default=0.8, help="activity EWMA lambda")
+    ap.add_argument("--a-T", type=float, default=5.0, help="activity staleness time constant T")
+    ap.add_argument("--gamma-a", type=float, default=0.5, help="activity mixing weight gamma")
     ap.add_argument("--a-min", type=float, default=0.05)
-    ap.add_argument("--q-beta", type=float, default=0.5, help="样本充分度指数 β")
+    ap.add_argument("--q-beta", type=float, default=0.5, help="sample-sufficiency exponent beta")
     ap.add_argument("--q-min", type=float, default=0.05)
     ap.add_argument("--q-use-size", type=int, default=0,
-                    help="Q 是否重复计入样本量：0=(κψν)^{1/3}（默认，避免与 n^d 重复计算）；1=(κψνs)^{1/4}")
-    ap.add_argument("--c-rho", type=float, default=0.3, help="贡献度 EWMA ρ")
-    # ---- W15 v0.3 支持度门控（默认关闭；判据见 research/paper/notes/week15_T050_预注册判据.md §2）----
+                    help="whether Q counts sample size again: 0=(kappa*psi*nu)^(1/3) (default, avoids double "
+                         "counting with n^d); 1=(kappa*psi*nu*s)^(1/4)")
+    ap.add_argument("--c-rho", type=float, default=0.3, help="contribution EWMA rho")
+    # ---- support gate (default off) ----
     ap.add_argument("--support-gate", type=int, default=0,
-                    help="1=开启支持度门控（v0.3）：退化客户端不进入参考头 + 豁免 ω/K 下限")
-    ap.add_argument("--gate-min-n", type=float, default=32.0, help="样本数低于该值判定为支持度退化")
-    ap.add_argument("--gate-min-classes", type=int, default=2, help="本地训练类别数低于该值判定为支持度退化")
-    # ---- W15 T050：共享交付物参考头规则（评估侧，一次运行给出全部变体；默认关闭）----
+                    help="1=enable the support gate: degraded clients are excluded from the reference "
+                         "head and exempt from the omega/K floor")
+    ap.add_argument("--gate-min-n", type=float, default=32.0,
+                    help="clients with fewer training samples are treated as support-degraded")
+    ap.add_argument("--gate-min-classes", type=int, default=2,
+                    help="clients with fewer local training classes are treated as support-degraded")
+    # ---- reference-head rule report (evaluation side, all variants in one run; default off) ----
     ap.add_argument("--ref-head-report", type=int, default=0,
-                    help="1=训练结束后额外评估参考头规则 {mean,gate,ensemble,calib}（不改训练过程）")
-    ap.add_argument("--calib-steps", type=int, default=300, help="calib 头在 D_val 上的拟合步数")
-    ap.add_argument("--calib-lr", type=float, default=1e-2, help="calib 头拟合学习率")
+                    help="1=additionally evaluate the reference-head rules {mean,gate,ensemble,calib} after "
+                         "training (the training procedure is unchanged)")
+    ap.add_argument("--calib-steps", type=int, default=300, help="fitting steps for the calib head on D_val")
+    ap.add_argument("--calib-lr", type=float, default=1e-2, help="learning rate for the calib head")
     ap.add_argument("--trip-balance", type=int, default=0,
-                    help="1=本地损失按 1/(所属行程窗口数) 加权（行程等权；默认 0=窗口等权）")
+                    help="1=weight the local loss by 1/(number of windows in the trip) (equal weight per trip; "
+                         "default 0=equal weight per window)")
     ap.add_argument("--fedrep-head-epochs", type=int, default=5,
-                    help="FedRep：每轮先只更新头部的 epoch 数（backbone 冻结）")
+                    help="FedRep: head-only epochs per round (backbone frozen)")
     ap.add_argument("--fedrep-body-epochs", type=int, default=1,
-                    help="FedRep：再只更新 backbone 的 epoch 数（头部冻结）")
+                    help="FedRep: backbone-only epochs afterwards (head frozen)")
     ap.add_argument("--allow-empty-round", type=int, default=0,
-                    help="仅 availability 生效：1=允许空轮（无人上线则该轮跳过、不聚合），"
-                         "用于分离「参与稀疏」与「保底单客户端轮换」（W23 稳健性检验）")
+                    help="availability only: 1=allow empty rounds (skip a round when nobody is online) to "
+                         "separate sparse participation from forced single-client rotation")
     ap.add_argument("--holdout-client", default="",
-                    help="留一客户端冷启动：该客户端不参与训练，训练后评估共享骨干的零样本与少样本头部")
+                    help="leave-one-client-out cold start: this client does not train; afterwards evaluate "
+                         "zero-shot and few-shot heads of the shared backbone")
     ap.add_argument("--cold-fracs", default="0.05,0.1,0.25",
-                    help="冷启动可用本地训练样本比例（逗号分隔；0 表示仅零样本）")
+                    help="fraction of the held-out client's training samples available for cold start "
+                         "(comma separated; 0 = zero-shot only)")
     args = ap.parse_args()
 
     if args.no_c:
-        # 第四轮修订：移除贡献项 C —— 不划 D_val（省 10% 训练数据与一次全量前向），
-        # 不评估候选完整模型（省算力、避免 head 上行的隐私争议），C 恒为 1
+        # contribution term C removed: no D_val split (saves 10% of the training data and one
+        # full forward pass) and no candidate full-model evaluation (saves compute and avoids
+        # uploading heads), so C stays 1
         args.c_exp = 0.0
         args.val_frac = 0.0
 
@@ -372,7 +378,7 @@ def main():
     out_dir = RESEARCH_DIR / "results" / "baselines" / exp_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- 数据与划分 ----------
+    # ---------- data and partitions ----------
     global N_CLASSES
     if args.dataset in ("har", "wisdm"):
         tag = "HAR" if args.dataset == "har" else "WISDM"
@@ -392,7 +398,7 @@ def main():
         partition_data = json.load(f)
     clients = sorted(partition_data.keys(), key=lambda s: int(s.split("_")[1]))
 
-    # ---------- 留一客户端冷启动：该客户端不参与训练，仅保留测试与本地样本 ----------
+    # ---------- leave-one-client-out cold start: this client trains on nothing and keeps only its test split ----------
     holdout_train_idx = holdout_test_idx = None
     if args.holdout_client:
         if args.holdout_client in partition_data:
@@ -402,7 +408,8 @@ def main():
         else:
             raise SystemExit(f"holdout client {args.holdout_client} not in partition")
 
-    # ---------- 共享验证集 D_val（所有算法同一协议；从训练池中划出、不参与本地训练） ----------
+    # ---------- shared validation set D_val (same protocol for all algorithms; carved out of the
+    # training pool and never used for local training) ----------
     val_holdout = {c: [] for c in clients}
     if args.val_frac > 0:
         rng = np.random.default_rng(args.seed * 100 + 7)
@@ -438,18 +445,19 @@ def main():
 
     val_idx = np.concatenate([np.asarray(val_holdout[c], dtype=int) for c in clients]) if args.val_frac > 0 else np.array([], dtype=int)
     X_val, y_val = tensors(val_idx) if len(val_idx) else (None, None)
-    # W16 · T053-b：服务器 D_val 标签对称噪声（默认 0=完全关闭；预注册见 week16_T053b_预注册判据.md §2）
+    # symmetric label noise on the server-side D_val (default 0=off)
     if len(val_idx) and args.val_noise_rate > 0:
-        rng_n = np.random.default_rng(args.seed * 1000 + 13)   # 独立 RNG 流：不扰动 schedule / val 抽样 / torch 种子
+        rng_n = np.random.default_rng(args.seed * 1000 + 13)   # separate stream: other seeds untouched
         n_cls_noise = N_CLASSES
         y_np = y_val.cpu().numpy().copy()
         flip = rng_n.random(y_np.shape[0]) < args.val_noise_rate
         m_flip = int(flip.sum())
         if m_flip:
-            off = rng_n.integers(0, n_cls_noise - 1, size=m_flip)   # 等概率翻到"其余两类"之一（对称噪声）
+            off = rng_n.integers(0, n_cls_noise - 1, size=m_flip)   # one of the other two classes
             y_np[flip] = (y_np[flip] + 1 + off) % n_cls_noise
         y_val = torch.tensor(y_np, dtype=torch.long)
-    # 每个客户端在 D_val 中占的片段（用于"留一客户端"贡献评估：C_i 只在**别人**的验证样本上算）
+    # slice each client occupies in D_val (for leave-one-out contribution: C_i uses only the
+    # validation samples of the *other* clients)
     val_masks = {}
     if len(val_idx):
         off = 0
@@ -457,7 +465,7 @@ def main():
             k = len(val_holdout[c])
             m = torch.zeros(len(val_idx), dtype=torch.bool)
             m[off:off + k] = True
-            val_masks[c] = ~m          # 排除客户端 c 自己
+            val_masks[c] = ~m          # exclude client c's own samples
             off += k
 
     def val_loss(model, exclude_client=None):
@@ -479,20 +487,21 @@ def main():
     n_full_bytes = flcore.state_bytes(global_model.state_dict())
     n_head_bytes = n_full_bytes - n_base_bytes
 
-    # ---------- 算法状态 ----------
+    # ---------- algorithm state ----------
     heads = {c: subset(global_model.state_dict(), head_keys(global_model.state_dict())) for c in clients}  # fedper
-    theta = {c: copy.deepcopy(global_model) for c in clients}   # ditto 个性化模型
-    pfed_theta = {c: copy.deepcopy(global_model) for c in clients}  # pfedme 个性化模型（参与者每轮刷新）
+    theta = {c: copy.deepcopy(global_model) for c in clients}   # ditto personalised models
+    pfed_theta = {c: copy.deepcopy(global_model) for c in clients}  # pfedme personalised models (refreshed by participants)
     pers_models = None
     local_models = {c: flcore.build_model(in_dim, N_CLASSES, seed=args.seed + i) for i, c in enumerate(clients)}  # local
 
-    # ---- SA-PFA 状态（proposed）----
+    # ---- SA-PFA state (proposed) ----
     estate = {c: proposed.ClientEvalState() for c in clients}
     contrib = proposed.ContributionScore(rho=args.c_rho)
     qstat = {}
     n_train = {c: len(np.asarray(partition_data[c]["train"], dtype=int)) for c in clients}
+    # local training class coverage (support gate; computed for all algorithms so reporting is fair)
     n_cls = {c: int(np.unique(y_all[np.asarray(partition_data[c]["train"], dtype=int)]).size)
-             for c in clients}   # 本地训练类别覆盖（支持度门控用；所有算法都算，便于公平报告）
+             for c in clients}
     if args.algo == "proposed":
         n_ref = float(np.median(list(n_train.values())))
         for c in clients:
@@ -512,13 +521,14 @@ def main():
     t_start = time.time()
     for t in range(args.rounds):
         participants = schedule[t]
-        if not participants:            # 仅当 --allow-empty-round 1 时可能出现
+        if not participants:            # only possible with --allow-empty-round 1
             skipped_rounds += 1
             continue
         states, weights, losses = [], [], []
         pers_eval = None
 
         if args.algo == "local":
+            # local-only training: no communication, used as the personalised reference
             for c in clients:
                 local_models[c], n_i, loss_i = flcore.train_local(
                     local_models[c], *client_train[c], epochs=1, lr=args.lr,
@@ -526,6 +536,10 @@ def main():
             pers_models = local_models
 
         elif args.algo in ("fedavg", "fedprox", "pfedme"):
+            # fedavg:    w <- sum_i (n_i / sum_j n_j) * w_i over all parameters
+            # fedprox:   local objective L_i(w) + (mu/2)||w - w^t||^2
+            # pfedme:    inner theta_i = argmin L_i(theta) + (lam/2)||theta - w||^2, outer
+            #            pseudo-gradient g_i = lam (w - theta_i); theta_i is the deployment model
             prox = args.mu if args.algo == "fedprox" else 0.0
             inner = args.inner_epochs if args.algo == "pfedme" else args.local_epochs
             thetas = {}
@@ -541,7 +555,7 @@ def main():
                 if args.algo == "pfedme":
                     thetas[c] = m
             if args.algo == "pfedme":
-                # 外层：w ← w − η·(λ(w−θ_i)) 的加权平均（Moreau envelope 伪梯度）
+                # outer step: w <- w - eta * lam * (w - theta_i), weighted mean (Moreau pseudo-gradient)
                 w = global_model.state_dict()
                 total = float(sum(weights))
                 agg = OrderedDict()
@@ -559,16 +573,18 @@ def main():
             comm_mb += (len(participants) * 2 * n_full_bytes) / 1e6
 
         elif args.algo in ("fedper", "fedperprox", "fedrep"):
+            # fedper: shared base + local personalised head, only the base is aggregated;
+            # fedperprox adds a prox term on the base; fedrep updates head, then backbone
             st = global_model.state_dict()
             base_upload = []
             for cid in participants:
                 c = clients[cid]
                 m = flcore.build_model(in_dim, N_CLASSES, seed=args.seed)
-                full = OrderedDict(st)          # 共享 base（当前全局）
-                full.update(heads[c])           # 本地个性化头
+                full = OrderedDict(st)          # shared base (current global)
+                full.update(heads[c])           # local personalised head
                 m.load_state_dict(full)
                 if args.algo == "fedrep":
-                    # FedRep：先在冻结 backbone 上更新头，再在冻结头上更新 backbone
+                    # FedRep: update the head with the backbone frozen, then the backbone with the head frozen
                     m, n_i, _ = flcore.train_local_scope(
                         m, *client_train[c], scope="head", head_prefix=HEAD_PREFIX,
                         epochs=args.fedrep_head_epochs, lr=args.lr,
@@ -583,14 +599,15 @@ def main():
                     m, n_i, loss_i = flcore.train_local(
                         m, *client_train[c], epochs=args.local_epochs, lr=args.lr,
                         batch_size=args.batch_size, seed=args.seed + t, **prox_kwargs)
-                heads[c] = subset(m.state_dict(), head_keys(st))   # 头部留在本地
+                heads[c] = subset(m.state_dict(), head_keys(st))   # the head stays local
                 base_upload.append(subset(m.state_dict(), base_keys(st)))
                 weights.append(n_i)
                 losses.append(loss_i)
             new_base = flcore.fedavg_aggregate(base_upload, weights)
             merged = OrderedDict(st)
             merged.update(new_base)
-            # 参考全局头：本轮参与者个性化头的平均（仅用于 global 协议的评估/报告，修正 week9 的未更新头 bug）
+            # reference global head: mean of this round's personalised heads (evaluation/reporting only;
+            # avoids scoring a head that was never updated)
             merged.update(ref_mean_head(heads, participants, st, clients))
             global_model.load_state_dict(merged)
             pers_models = {}
@@ -603,7 +620,9 @@ def main():
             comm_mb += (len(participants) * 2 * n_base_bytes) / 1e6
 
         elif args.algo == "proposed":
-            # ===== SA-PFA（第 10 周设计文档 §2-§6）=====
+            # SA-PFA: activity/quality/contribution-driven sparse-aware aggregation (weight floor
+            # omega, temporal smoothing eta) plus a prox term on the shared backbone and a local
+            # personalised head; contribution C is the drop in D_val loss
             st = global_model.state_dict()
             entries, base_upload, cand = [], [], {}
             for cid in participants:
@@ -615,7 +634,7 @@ def main():
                 m, n_i, loss_i = flcore.train_local(
                     m, *client_train[c], epochs=args.local_epochs, lr=args.lr,
                     batch_size=args.batch_size, seed=args.seed + t,
-                    prox_mu=args.mu_sa, prox_skip_prefix=HEAD_PREFIX,   # prox 只约束共享 backbone
+                    prox_mu=args.mu_sa, prox_skip_prefix=HEAD_PREFIX,   # prox constrains the shared backbone only
                     sample_weights=trip_weights.get(c))
                 heads[c] = subset(m.state_dict(), head_keys(st))
                 base_upload.append(subset(m.state_dict(), base_keys(st)))
@@ -624,20 +643,20 @@ def main():
                 a_i = proposed.activity_score(estate[c], t, lam=args.a_lam, T=args.a_T,
                                               gamma=args.gamma_a, a_min=args.a_min)
                 entries.append(dict(cid=c, A=a_i, Q=qstat[c], C=1.0, n=n_i, n_cls=n_cls[c]))
-            # §4 贡献度：D_val 上的损失下降（全局模型 vs 客户端完整模型）
-            # --no-c：移除贡献项（不再需要 D_val，也不评估候选完整模型），C 恒为 1
+            # contribution: drop in D_val loss (global model vs the client's full model)
+            # --no-c: contribution term removed (no D_val, no candidate evaluation), so C stays 1
             if args.no_c:
                 cnorm = {e["cid"]: 1.0 for e in entries}
             else:
                 loss_g = val_loss(global_model)
                 for c in cand:
-                    # 留一客户端（LOO）：C_i 只用"其他客户端"的验证样本，避免"自评自夸"
+                    # leave-one-out: C_i uses only the other clients' validation samples, avoiding self-scoring
                     contrib.observe(c, val_loss(global_model, exclude_client=c),
                                     val_loss(cand[c], exclude_client=c))
                 cnorm = contrib.normalized([e["cid"] for e in entries])
             for e in entries:
                 e["C"] = cnorm[e["cid"]]
-            # §5 稀疏感知聚合
+            # sparse-aware aggregation
             gate_kw = {}
             if args.support_gate:
                 gate_kw = dict(gate_min_n=args.gate_min_n, gate_min_classes=args.gate_min_classes)
@@ -648,8 +667,10 @@ def main():
             new_base = flcore.fedavg_aggregate(base_upload, [alpha[e["cid"]] for e in entries])
             merged = OrderedDict(st)
             merged.update(new_base)
-            # 参考全局头：参与者个性化头的**均匀**平均（与 fedper 同口径；仅用于 global 协议评估/报告）
-            # v0.3 门控：支持度退化客户端不进入参考头平均（全体命中时退化为原口径）
+            # reference global head: *uniform* mean of the participants' personalised heads (same
+            # convention as fedper; evaluation/reporting only)
+            # support gate: support-degraded clients are left out of the reference head (falls back to
+            # the default convention if every participant is gated)
             head_parts = [p for p in participants if clients[int(p)] not in gated] or list(participants)
             refh = ref_mean_head(heads, head_parts, st, clients)
             if os.environ.get("SA_PFA_DEBUG"):
@@ -671,10 +692,12 @@ def main():
                 full.update(heads[c])
                 m.load_state_dict(full)
                 pers_models[c] = m
-            # 通信量口径：只有 backbone 跨端（head 永不上传，见 §4.1）
+            # communication accounting: only the backbone crosses clients (the head is never uploaded)
             comm_mb += (len(participants) * 2 * n_base_bytes) / 1e6
 
         elif args.algo == "ditto":
+            # ditto: FedAvg for w, then each client re-anchors theta_i on w with
+            # L_i(theta) + (lam/2)||theta - w||^2
             for cid in participants:
                 c = clients[cid]
                 m, n_i, loss_i = flcore.train_local(
@@ -685,14 +708,14 @@ def main():
                 losses.append(loss_i)
             global_model.load_state_dict(flcore.fedavg_aggregate(states, weights))
             comm_mb += (len(participants) * 2 * n_full_bytes) / 1e6
-            for cid in participants:   # 个性化模型以新全局 w 为锚点更新（不上传）
+            for cid in participants:   # personalised model re-anchored on the new global w (never uploaded)
                 c = clients[cid]
                 theta[c], _, _ = flcore.train_local(
                     theta[c], *client_train[c], epochs=args.local_epochs, lr=args.lr,
                     batch_size=args.batch_size, seed=args.seed + t, prox_mu=args.lam)
             pers_models = theta
 
-        # ---------- 评估 ----------
+        # ---------- evaluation ----------
         if args.algo == "local":
             f1s, accs = personalized_metrics(pers_models, client_test)
             g_row = None
@@ -719,7 +742,7 @@ def main():
 
     elapsed = time.time() - t_start
 
-    # ---------- 保存 ----------
+    # ---------- save ----------
     with open(out_dir / "history.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(history[0].keys()))
         w.writeheader()
@@ -741,9 +764,9 @@ def main():
         final["per_client_pers_f1"] = pf1
         torch.save({c: m.state_dict() for c, m in pers_models.items()}, out_dir / "pers_final.pt")
 
-    # ---------- 留一客户端冷启动评估（共享骨干的零样本 / 少样本头部 / 本地从零训练） ----------
+    # ---------- leave-one-client-out cold start (zero-shot / few-shot head / local training from scratch) ----------
     if holdout_train_idx is not None and args.algo != "local":
-        import torch.nn.functional as F  # noqa: F401  (局部导入，避免影响主流程)
+        import torch.nn.functional as F  # noqa: F401  (local import to keep it out of the main path)
         hx, hy = tensors(holdout_train_idx)
         tx, ty = tensors(holdout_test_idx)
 
@@ -761,7 +784,7 @@ def main():
             k = max(1, int(round(frac * len(holdout_train_idx))))
             pick = np.sort(rng_c.choice(len(holdout_train_idx), size=k, replace=False))
             sx, sy = hx[pick], hy[pick]
-            # (a) 共享骨干 + 只用 k 个样本拟合头部
+            # (a) shared backbone + head fitted on the k available samples only
             m = flcore.build_model(in_dim, N_CLASSES, seed=args.seed)
             m.load_state_dict(global_model.state_dict())
             for name, p in m.named_parameters():
@@ -779,7 +802,7 @@ def main():
                     opt.step()
             m.eval()
             cold["results"][f"head_{frac:g}"] = _eval_cold(m)
-            # (b) 同一批 k 个样本从零本地训练
+            # (b) train the same k samples from scratch on the client
             m2 = flcore.build_model(in_dim, N_CLASSES, seed=args.seed)
             m2, _, _ = flcore.train_local(m2, sx, sy, epochs=5, lr=args.lr,
                                           batch_size=args.batch_size, seed=args.seed)
@@ -787,7 +810,8 @@ def main():
             cold["results"][f"local_{frac:g}"] = _eval_cold(m2)
         final["cold_start"] = cold
 
-    # ---------- W15 T050：参考头规则对照（评估侧；同一骨干，只换"共享交付物"的定义） ----------
+    # ---------- reference-head rule comparison (evaluation side; same backbone, only the definition
+    # of the shared deliverable changes) ----------
     if args.ref_head_report and args.algo != "local":
         head_src = heads if args.algo in ("fedper", "fedperprox", "fedrep", "proposed") else None
         try:
@@ -797,7 +821,7 @@ def main():
                 n_cls=n_cls, n_train=n_train, n_min=args.gate_min_n, min_classes=args.gate_min_classes,
                 calib_steps=args.calib_steps, calib_lr=args.calib_lr, seed=args.seed, in_dim=in_dim,
                 n_classes=N_CLASSES)
-        except Exception as exc:  # 变体评估失败不应毁掉主结果
+        except Exception as exc:  # a failed variant evaluation must not destroy the main results
             final["ref_head_variants"] = {"error": f"{type(exc).__name__}: {exc}"}
         final["ref_head_meta"] = dict(last_participants=[clients[int(p)] for p in participants],
                                       n_cls=n_cls, n_train=n_train)

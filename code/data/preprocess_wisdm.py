@@ -1,17 +1,19 @@
-"""WISDM 1.1（UCI 507）预处理：手机加速度计，6 类粗活动，块级无泄漏划分。
+"""WISDM 1.1 preprocessing: phone accelerometer, 6 coarse activities, block-level leak-free split.
 
-数据：raw/phone/accel/data_<subject>_accel_phone.txt
-格式：subject,activity,timestamp_ns,x,y,z;
-活动代码：A 走 B 跑 C 上楼 D 下楼 E 坐 F 站（其余 12 类丢弃）。
-采样 15 Hz，窗口 3 s（45 点）、50% 重叠；每轴 6 个统计量 + 合加速度 2 个 = 20 维。
+Data: data/raw/WISDM/wisdm-dataset.zip (phone accelerometer files)
+Format: subject,activity,timestamp_ns,x,y,z;
+Activity codes: A walk, B jog, C stairs up, D stairs down, E sit, F stand (the other 12 classes
+are discarded). Sampling 15 Hz, 3 s windows (45 points) with 50% overlap; 6 statistics per axis
+plus 2 for the acceleration magnitude = 20 dims.
 
-划分：
-  natural         每个 (subject, class) 的连续片段按时间 70/30，中间丢 2 窗口作 gap；
-                  客户端 = 受试者（51 个）。
-  dirichlet_a0.05 训练窗口按类别用 Dirichlet(α) 重分给 51 个客户端（保留偏斜），
-                  测试集仍按受试者划分（每个客户端覆盖 6 类）。
+Splits:
+  natural         for each (subject, class) the contiguous segment is cut 70/30 in time, with
+                  2 windows dropped as a gap; client = subject (51 subjects).
+  dirichlet_a0.05 training windows are redistributed by class with Dirichlet(alpha) over the 51
+                  clients (skew preserved); the test split stays per subject, so every client
+                  covers all 6 classes.
 
-产出：
+Outputs:
   data/processed/WISDM/features_wisdm.npz           X, y, subject, trip(segment id)
   data/processed/WISDM/partitions/partition_wisdm_natural.json
   data/processed/WISDM/partitions/partition_wisdm_dirichlet_a0.05.json
@@ -33,7 +35,7 @@ W, STRIDE, GAP = 45, 22, 2
 
 
 def window_feats(w: np.ndarray) -> np.ndarray:
-    """w: (W,3) -> 20 维统计量。"""
+    """w: (W,3) -> 20 statistics."""
     f = []
     for j in range(3):
         x = w[:, j]
@@ -107,7 +109,7 @@ def main():
     np.savez_compressed(OUT / "features_wisdm.npz", X=X, y=y, subject=subject, trip=tripid)
     print(f"saved X={X.shape} classes={np.bincount(y)} subjects={len(set(subject))}")
 
-    # natural：每个 (subject,class) 时序 70/30 + 2 窗口 gap
+    # natural: per (subject, class) chronological 70/30 with a 2-window gap
     subs = sorted(set(subject.tolist()))
     part = {}
     for j, s in enumerate(subs):
@@ -130,7 +132,7 @@ def main():
     print(f"natural: {len(part)} clients, train={sum(a for a,_ in sizes)} "
           f"test={sum(b for _,b in sizes)} min={min(min(a,b) for a,b in sizes)}")
 
-    # Dirichlet：只重分训练窗口，测试集保持逐受试者
+    # Dirichlet: only the training windows are redistributed, the test split stays per subject
     tr_pool = np.concatenate([np.asarray(v["train"], dtype=int) for v in part.values()])
     rng = np.random.default_rng(42)
     alloc = [[] for _ in subs]

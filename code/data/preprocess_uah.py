@@ -1,21 +1,20 @@
-"""第 5 周 · T018/T019/T020：UAH-DriveSet 数据管线。
+"""UAH-DriveSet preprocessing pipeline.
 
-流程（与 18 周计划一致）：
-    Raw -> Cleaning -> Resampling -> Normalization -> Windowing -> Label -> Client Split
+Stages: Raw -> Cleaning -> Resampling -> Normalization -> Windowing -> Label -> Client Split
 
-- 输入：research/data/raw/UAH-DriveSet/UAH-DRIVESET-v1/D*/<trip>/
-  - RAW_ACCELEROMETERS.txt（11 列：t, act, ax, ay, az, ax_kf, ay_kf, az_kf, roll, pitch, yaw）
-  - RAW_GPS.txt（12 列：t, speed, lat, lon, alt, v_acc, h_acc, course, difcourse, s1, s2, s3）
-  - 文件夹名：<时间戳>-<里程>-<D#>-(NORMAL1|NORMAL2|NORMAL|DROWSY|AGGRESSIVE)-<SECONDARY|MOTORWAY>
-- 输出：research/data/processed/UAH/
-  - windows_L{10,30,60}.npz  归一化后的 (N, L*10, 7) 时序窗口 + 标签/司机/行程/道路
-  - features_L{10,30,60}.npz 窗口统计特征 (N, 47)，供轻量模型与 FedAvg 冒烟实验使用
+- Input: data/raw/UAH-DriveSet/UAH-DRIVESET-v1/D*/<trip>/
+  - RAW_ACCELEROMETERS.txt (11 columns: t, act, ax, ay, az, ax_kf, ay_kf, az_kf, roll, pitch, yaw)
+  - RAW_GPS.txt (12 columns: t, speed, lat, lon, alt, v_acc, h_acc, course, difcourse, s1, s2, s3)
+  - folder name: <timestamp>-<mileage>-<D#>-(NORMAL1|NORMAL2|NORMAL|DROWSY|AGGRESSIVE)-<SECONDARY|MOTORWAY>
+- Output: data/processed/UAH/
+  - windows_L{10,30,60}.npz  normalised (N, L*10, 7) time-series windows + label/driver/trip/road
+  - features_L{10,30,60}.npz window statistics (N, 47) for the lightweight models and smoke tests
   - trips_summary.csv / client_label_distribution.csv / scaler_stats.csv
 
-说明：
-- 归一化用「每位司机各自」的 z-score（司机=客户端，互不共享原始数据的场景近似；
-  严格协议应在训练集上拟合 scaler，此处记录，正式实验（第 13 周）切换）。
-- 每窗口的标签 = 行程级行为标签（NORMAL/DROWSY/AGGRESSIVE）。
+Notes:
+- Normalisation is a per-driver z-score (driver = client, an approximation of clients that never
+  share raw data; a strict protocol would fit the scaler on the training split only).
+- The window label is the trip-level behaviour label (NORMAL/DROWSY/AGGRESSIVE).
 """
 from __future__ import annotations
 
@@ -31,9 +30,9 @@ RESEARCH_DIR = CODE_DIR.parent
 RAW_ROOT = RESEARCH_DIR / "data" / "raw" / "UAH-DriveSet" / "UAH-DRIVESET-v1"
 OUT_DIR = RESEARCH_DIR / "data" / "processed" / "UAH"
 
-FS = 10.0            # 目标采样率 (Hz)，加速度计原生 ~10Hz
-GAP_SPLIT_S = 1.0    # 相邻样本间隔超过该值则切段（原始数据丢包/断采）
-WINDOW_LENGTHS = [10, 30, 60]   # 秒
+FS = 10.0            # target sampling rate (Hz); the accelerometer is natively ~10 Hz
+GAP_SPLIT_S = 1.0    # start a new segment when consecutive samples are further apart (dropped samples)
+WINDOW_LENGTHS = [10, 30, 60]   # seconds
 LABEL_MAP = {"NORMAL": 0, "DROWSY": 1, "AGGRESSIVE": 2}
 LABEL_NAMES = ["Normal", "Drowsy", "Aggressive"]
 ACC_COLS = [0, 2, 3, 4, 8, 9, 10]     # t, ax, ay, az, roll, pitch, yaw
@@ -47,13 +46,13 @@ def loadtxt_clean(path: Path, cols) -> np.ndarray:
         arr = arr[None, :]
     arr = arr[:, cols]
     arr = arr[np.isfinite(arr[:, 0])]
-    # 时间递增去重
+    # drop duplicate timestamps, keeping increasing time
     keep = np.concatenate([[True], np.diff(arr[:, 0]) > 0])
     return arr[keep]
 
 
 def split_segments(t: np.ndarray, gap_s: float = GAP_SPLIT_S):
-    """按时间间断分段，返回 [(i0, i1), ...]（闭开区间）。"""
+    """Split at time gaps, returns [(i0, i1), ...] (half-open intervals)."""
     if len(t) == 0:
         return []
     breaks = np.where(np.diff(t) > gap_s)[0]
@@ -71,21 +70,21 @@ def process_trip(trip_dir: Path):
     if len(acc) < 100 or len(gps) < 10:
         return None
 
-    # 时间对齐到 [max(t0), min(t1)] 的 10Hz 网格
+    # align both streams to a 10 Hz grid over [max(t0), min(t1)]
     t0 = max(acc[0, 0], gps[0, 0])
     t1 = min(acc[-1, 0], gps[-1, 0])
     if t1 - t0 < 60:
         return None
     grid = np.arange(t0, t1, 1.0 / FS)
 
-    # 先用"原始观测"切段（防止长间断被插值掩盖）
+    # segment on the raw observations first (a long gap must not be hidden by interpolation)
     segs_acc = split_segments(acc[:, 0])
     segs = []
     for i0, i1 in segs_acc:
         a = acc[i0:i1]
         if len(a) < FS * 10:
             continue
-        # 该段覆盖的时间范围对应的网格切片
+        # grid slice covering the time span of this segment
         m = (grid >= a[0, 0]) & (grid <= a[-1, 0])
         if m.sum() < FS * 10:
             continue
@@ -97,13 +96,13 @@ def process_trip(trip_dir: Path):
         ok = np.isfinite(sp)
         if (~ok).all():
             continue
-        sp = np.interp(g, g[ok], sp[ok])  # 端点外推填充
+        sp = np.interp(g, g[ok], sp[ok])  # fill beyond the observed endpoints
         X = np.stack([sp] + chans, axis=1)  # (T, 7) = speed, ax, ay, az, roll, pitch, yaw
         segs.append((g, X))
     if not segs:
         return None
 
-    # 清洗：幅度裁剪（物理范围），再统计原始时间覆盖
+    # cleaning: clip to physical ranges, then measure the actual time coverage
     for _, X in segs:
         np.clip(X[:, 0], 0, 300, out=X[:, 0])          # speed <= 300 km/h
         np.clip(X[:, 1:4], -4, 4, out=X[:, 1:4])       # accel <= 4g
@@ -114,7 +113,7 @@ def process_trip(trip_dir: Path):
 
 
 def normalize_by_driver(trips):
-    """按司机统计 mean/std（仅用该司机自己的数据）。返回 {driver: (mean, std)}。"""
+    """Per-driver mean/std (each driver's own data only). Returns {driver: (mean, std)}."""
     stats = {}
     for drv in sorted({t["driver"] for t in trips}):
         allX = np.concatenate([X for t in trips if t["driver"] == drv for _, X in t["segs"]], axis=0)
@@ -126,7 +125,7 @@ def normalize_by_driver(trips):
 
 
 def window_features(X: np.ndarray) -> np.ndarray:
-    """窗口统计特征：7 通道 x 6 统计量 + 5 个速度/合加速度特征 = 47 维。"""
+    """Window statistics: 7 channels x 6 statistics + 5 speed/acceleration features = 47 dims."""
     feats, names = [], []
     for i, ch in enumerate(CHANNELS):
         v = X[:, i]
@@ -160,7 +159,7 @@ def main():
             for i, ch in enumerate(CHANNELS):
                 w.writerow([drv, ch, f"{mean[i]:.6f}", f"{std[i]:.6f}"])
 
-    # 窗口收集
+    # window collection
     store = {L: dict(X=[], y=[], feats=[], driver=[], trip=[], road=[], t0=[]) for L in WINDOW_LENGTHS}
     feature_names = None
     trip_rows = []
@@ -209,7 +208,7 @@ def main():
         cls = np.bincount(np.asarray(d["y"]), minlength=3)
         print(f"L={L:>2}s windows: {n:5d}  class(N/D/A)={cls.tolist()}  saved windows/features npz")
 
-    # 司机 x 类别窗口分布（L=30，作为"天然 Non-IID"证据）
+    # driver x class window distribution (L=30), evidence of the natural Non-IID split
     d = store[30]
     drv_arr = np.asarray(d["driver"]); y_arr = np.asarray(d["y"])
     with open(OUT_DIR / "client_label_distribution.csv", "w", newline="", encoding="utf-8") as f:

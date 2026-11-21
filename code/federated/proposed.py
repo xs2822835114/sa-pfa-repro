@@ -1,19 +1,24 @@
-"""第 11 周 · T043：SA-PFA（Sparse-Aware Personalized Federated Aggregation）实现。
+"""SA-PFA: Sparse-Aware Personalized Federated Aggregation.
 
-与第 10 周设计文档（research/paper/notes/week10_SA-PFA方法设计.md）逐节对应：
-  §2 ActivityScore      活跃度 A_i：EWMA 参与率（离线轮补齐）+ 新鲜度衰减 + 下限 A_min
-  §3 QualityScore       数据质量 Q_i：完整性 κ · 邻域标签一致性 ψ · 近重复冲突率 ν · 样本充分度 s
-  §4 ContributionScore  贡献度 Ĉ_i：全局验证集损失下降 → EWMA → 均值归一化 + 截断 [0.5, 1.5]
-  §5 sparse_aware_weights  稀疏感知聚合：度量加权 → 时间平滑 η → 权重下限 ω → 归一化
-   §5' 支持度门控（W15 v0.3，默认关闭）：n_i < gate_min_n 或 类别数 < gate_min_classes 的
-       "支持度退化"参与者豁免 ω/K 下限（见 research/paper/notes/week15_T050_预注册判据.md §2）
-  §6 结构：共享 backbone 聚合（Σα_i·φ_i）+ 本地个性化头（不参与聚合）+ 共享层 prox（μ）
+ActivityScore          A_i: EWMA participation rate with offline-round backfill, staleness
+                       decay and a lower bound A_min
+QualityScore           Q_i: completeness kappa * neighbourhood label agreement psi *
+                       near-duplicate conflict rate nu * sample sufficiency s
+ContributionScore      C_i: drop in D_val loss -> EWMA -> mean normalisation, clipped to [0.5, 1.5]
+sparse_aware_weights   measure weighting -> temporal smoothing eta -> weight floor omega ->
+                       normalisation; the optional support gate exempts support-degraded
+                       participants (n_i < gate_min_n or fewer than gate_min_classes classes)
+                       from the omega/K floor
+Structure              the shared backbone is aggregated as sum_i alpha_i * phi_i, the
+                       personalised head stays local and is never aggregated, and a prox term
+                       mu constrains the shared layers only
 
-自检（T044 的一部分）：
-  /opt/anaconda3/bin/python research/code/federated/proposed.py
-  - 活跃度：与逐轮 EWMA 暴力实现逐位对比（含离线 gap）
-  - 质量：κ/ψ/ν/s 边界与几何平均手算对比
-  - 权重：退化性（A=Q=C=1, ω=η=0 → α ∝ n^d）、下限性质（α_i ≥ ω/K）、归一化（Σα=1）
+Self-check (run directly, needs no data):
+  python code/federated/proposed.py
+  - activity: compared bit for bit against a brute-force per-round EWMA (including gaps)
+  - quality: kappa/psi/nu/s boundary cases against hand-computed geometric means
+  - weights: degeneracy (A=Q=C=1, omega=eta=0 -> alpha proportional to n^d), floor property
+    (alpha_i >= omega/K) and normalisation (sum alpha = 1)
 """
 from __future__ import annotations
 
@@ -23,28 +28,29 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
-# §2 活跃度
+# Activity score
 # --------------------------------------------------------------------------- #
 @dataclass
 class ClientEvalState:
-    """每客户端的评估状态（服务器侧维护；A/Q 的原始量由客户端自报标量）。"""
+    """Per-client evaluation state kept on the server (A/Q raw quantities are self-reported scalars)."""
 
-    a_ema: float = 0.0          # ā_i：EWMA 参与率
-    last_seen: int = -1         # τ_i：上次参与轮次（-1 = 从未参与）
-    q_ema: float = 1.0          # Q̄_i：质量（本数据集为静态量，接口保留 EWMA）
-    c_ema: float = 1.0          # C̄_i：贡献度 EWMA
-    alpha_hat: float | None = None   # α̂_i：时间平滑后的权重
-    n: int = 0                  # n_i：本地样本数
+    a_ema: float = 0.0          # a_bar_i: EWMA participation rate
+    last_seen: int = -1         # tau_i: last participating round (-1 = never)
+    q_ema: float = 1.0          # Q_bar_i: quality (static here; the EWMA interface is kept)
+    c_ema: float = 1.0          # C_bar_i: contribution EWMA
+    alpha_hat: float | None = None   # alpha_hat_i: temporally smoothed weight
+    n: int = 0                  # n_i: local sample count
 
 
 def activity_score(state: ClientEvalState, t: int, lam: float = 0.8, T: float = 5.0,
                    gamma: float = 0.5, a_min: float = 0.05) -> float:
-    """客户端在第 t 轮参与时的活跃度 A_i(t)（设计文档 §2）。
+    """Activity A_i(t) of a client that participates in round t.
 
-    - ā_i 按"离线轮 p=0、本轮 p=1"的 EWMA 补齐：ā ← λ^gap·ā + (1−λ)，gap = t − τ_i
-      （首次参与时 τ_i = −1，等价于"从第 0 轮起一直离线"，gap 取 t+1）
-    - r_i 用**到达前的** staleness：r = exp(−(gap−1)/T)（gap=1 即连续参与 → r=1）
-    - A_i = clip(γ·ā + (1−γ)·r, A_min, 1)；随后更新 τ_i ← t
+    - a_bar_i is backfilled with offline rounds (p=0) and this round (p=1):
+      a <- lam^gap * a + (1-lam), gap = t - tau_i
+      (first participation: tau_i = -1, equivalent to being offline since round 0, gap = t+1)
+    - r_i uses the staleness *before* arrival: r = exp(-(gap-1)/T) (gap=1 -> r=1)
+    - A_i = clip(gamma*a + (1-gamma)*r, A_min, 1); then tau_i <- t
     """
     first = state.last_seen < 0
     gap = (t + 1) if first else (t - state.last_seen)
@@ -56,14 +62,16 @@ def activity_score(state: ClientEvalState, t: int, lam: float = 0.8, T: float = 
 
 def activity_trace(participated: list[bool], lam: float = 0.8, T: float = 5.0,
                    gamma: float = 0.5, a_min: float = 0.05) -> list[float]:
-    """给定每轮是否参与，返回 A_i(t) 序列（离线轮返回的是"若此刻上线"的 A；用于画图/自检）。"""
+    """A_i(t) sequence for a given participation trace (offline rounds report the value the
+    client would obtain if it came online now; used for plotting and self-checks)."""
     state = ClientEvalState()
     out = []
     for t, p in enumerate(participated):
         if p:
             out.append(activity_score(state, t, lam=lam, T=T, gamma=gamma, a_min=a_min))
         else:
-            # 离线轮：不更新状态，仅记录"此刻若上线"的参考值（不改变 last_seen）
+            # offline round: state is not updated, only the "if online now" reference value is
+            # recorded (last_seen is unchanged)
             first = state.last_seen < 0
             gap = (t + 1) if first else (t - state.last_seen)
             a = lam ** gap * state.a_ema + (1.0 - lam)
@@ -73,13 +81,14 @@ def activity_trace(participated: list[bool], lam: float = 0.8, T: float = 5.0,
 
 
 # --------------------------------------------------------------------------- #
-# §3 数据质量
+# Data quality
 # --------------------------------------------------------------------------- #
 def neighborhood_stats(X: np.ndarray, y: np.ndarray, k: int = 5) -> dict:
-    """本地数据的邻域结构（全部在客户端本地计算，只上传 2 个标量）。
+    """Neighbourhood structure of the local data (computed on the client; only 2 scalars are uploaded).
 
-    ψ （标签一致性）= 每窗口 k 近邻中同标签比例的平均
-    ν （无近重复冲突）= 1 − 近重复对（距离 < 0.5×中位距离）中标签冲突的比例
+    psi (label agreement)  = mean fraction of same-label windows among the k nearest neighbours
+    nu  (no near-duplicate conflict) = 1 - fraction of near-duplicate pairs (distance <
+         0.5 * median distance) whose labels disagree
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y)
@@ -105,11 +114,12 @@ def neighborhood_stats(X: np.ndarray, y: np.ndarray, k: int = 5) -> dict:
 
 def quality_score(n: int, n_ref: float, kappa: float = 1.0, psi: float = 1.0, nu: float = 1.0,
                   beta: float = 0.5, q_min: float = 0.05, use_size: bool = False) -> float:
-    """Q_i（设计文档 §3）。
+    """Quality score Q_i.
 
-    use_size=False（默认）: Q = clip((κ·ψ·ν)^{1/3}) —— 样本量已经通过 α 里的 n_i^d 生效，
-                            不重复计入质量项（避免对大数据客户端的二次偏置）
-    use_size=True         : Q = clip((κ·ψ·ν·s)^{1/4})，s = min(1, n/n_ref)^β
+    use_size=False (default): Q = clip((kappa*psi*nu)^(1/3)) - sample size already enters through
+                              n_i^d in alpha, so it is not counted twice (avoids a second bias
+                              towards large clients)
+    use_size=True           : Q = clip((kappa*psi*nu*s)^(1/4)), s = min(1, n/n_ref)^beta
     """
     n_ref = max(float(n_ref), 1.0)
     s = min(1.0, float(n) / n_ref) ** beta
@@ -121,10 +131,10 @@ def quality_score(n: int, n_ref: float, kappa: float = 1.0, psi: float = 1.0, nu
 
 
 # --------------------------------------------------------------------------- #
-# §4 贡献度
+# Contribution score
 # --------------------------------------------------------------------------- #
 class ContributionScore:
-    """服务器侧贡献度：C^raw = clip((ℓ(φ^t;D_val) − ℓ(φ_i^t;D_val)) / ℓ(φ^t;D_val), 0, 1)。"""
+    """Server-side contribution: C_raw = clip((L(phi^t;D_val) - L(phi_i^t;D_val)) / L(phi^t;D_val), 0, 1)."""
 
     def __init__(self, rho: float = 0.3, c_min: float = 0.5, c_max: float = 1.5):
         self.rho = rho
@@ -155,7 +165,7 @@ class ContributionScore:
 
 
 # --------------------------------------------------------------------------- #
-# §5 稀疏感知聚合
+# Sparse-aware aggregation
 # --------------------------------------------------------------------------- #
 def sparse_aware_weights(entries: list[dict], states: dict[str, ClientEvalState],
                          exp_a: float = 1.0, exp_b: float = 1.0, exp_c: float = 1.0,
@@ -163,12 +173,13 @@ def sparse_aware_weights(entries: list[dict], states: dict[str, ClientEvalState]
                          normalize: bool = True,
                          gate_min_n: float | None = None,
                          gate_min_classes: int | None = None) -> dict[str, float]:
-    """α_i：度量加权 → 时间平滑 → 权重下限 → 归一化（设计文档 §5）。
+    """alpha_i: measure weighting -> temporal smoothing -> weight floor -> normalisation.
 
-    entries: [{'cid':str, 'A':float, 'Q':float, 'C':float, 'n':int}, ...]（本轮参与者）
+    entries: [{'cid':str, 'A':float, 'Q':float, 'C':float, 'n':int}, ...] (this round's participants)
 
-    W15 v0.3：gate_min_n / gate_min_classes 给出时启用支持度门控——命中者豁免 ω/K 下限
-    （直接用平滑权重 α̂ 参与归一化），不改变其他参与者的任何算式。
+    When gate_min_n / gate_min_classes are given the support gate is active: gated clients
+    skip the omega/K floor (their smoothed weight enters normalisation unchanged) and no other
+    participant's computation changes.
     """
     if len(entries) == 0:
         return {}
@@ -195,11 +206,12 @@ def sparse_aware_weights(entries: list[dict], states: dict[str, ClientEvalState]
 
 def gated_clients(entries: list[dict], gate_min_n: float | None = None,
                   gate_min_classes: int | None = None) -> set:
-    """支持度门控（W15 §v0.3）：返回本轮参与者中被判定为"支持度退化"的 cid 集合。
+    """Support gate: returns the participants judged support-degraded in this round.
 
-    规则（预注册写死，见 week15_T050_预注册判据.md §2）：
-      n_i < gate_min_n 或 类别数 k_i < gate_min_classes（任一开启即生效；均关闭返回空集）。
-    entries 需含 'n'；若提供 'n_cls'（本地训练类别数）则参与类别覆盖判定。
+    Rule: n_i < gate_min_n or number of classes k_i < gate_min_classes (either check activates
+    when its threshold is set; both unset returns the empty set).
+    entries must contain 'n'; when 'n_cls' (local training classes) is present it also drives the
+    class-coverage check.
     """
     out: set = set()
     if not gate_min_n and not gate_min_classes:
@@ -218,7 +230,7 @@ def gated_clients(entries: list[dict], gate_min_n: float | None = None,
 
 def weights_from_schedule(sched: dict[int, list[int]], rounds: int, N: int,
                           A_of, Q_of, C_of, n_of, **kw) -> dict[int, dict[str, float]]:
-    """离线工具：用给定参与调度推演 α 轨迹（第 12/14 周分析用）。"""
+    """Offline helper: replay the alpha trajectory for a given participation schedule (analysis only)."""
     states = {c: ClientEvalState() for c in range(N)}
     out = {}
     for t in range(rounds):
@@ -231,10 +243,10 @@ def weights_from_schedule(sched: dict[int, list[int]], rounds: int, N: int,
 
 
 # --------------------------------------------------------------------------- #
-# 自检
+# Self-check
 # --------------------------------------------------------------------------- #
 def _brute_force_activity(p: list[bool], lam: float, T: float, gamma: float, a_min: float) -> list[float]:
-    """逐轮暴力 EWMA（p=0/1），用于对照 activity_score 的补齐公式。"""
+    """Round-by-round brute-force EWMA (p=0/1), used to validate the backfill formula."""
     a = 0.0
     last = None
     out = []
@@ -252,7 +264,7 @@ def _self_test() -> None:
     rng = np.random.default_rng(0)
     ok = True
 
-    # 1) 活跃度：补齐公式 vs 暴力 EWMA
+    # 1) activity: backfill formula vs brute-force EWMA
     for trial in range(20):
         p = (rng.random(60) < 0.4).tolist()
         if not any(p):
@@ -263,41 +275,42 @@ def _self_test() -> None:
         if not np.allclose(fast, slow, atol=1e-12):
             ok = False
             print(f"[FAIL] activity trial {trial}: fast={fast[:4]} slow={slow[:4]}")
-    print(f"[ok] activity_score 与暴力 EWMA 一致（lam=0.8, T=5, gamma=0.5）: {ok}")
+    print(f"[ok] activity_score matches brute-force EWMA (lam=0.8, T=5, gamma=0.5): {ok}")
 
-    # 2) 质量：几何平均与样本充分度
-    q1 = quality_score(100, 100)                       # 全 1 → 1
-    q2 = quality_score(25, 100, use_size=True)         # s=0.5 → 0.5^{1/4}
+    # 2) quality: geometric mean and sample sufficiency
+    q1 = quality_score(100, 100)                       # all ones -> 1
+    q2 = quality_score(25, 100, use_size=True)         # s=0.5 -> 0.5^{1/4}
     q3 = quality_score(0, 100, kappa=0.0)
-    print(f"[ok] quality_score: Q(全1)={q1:.4f} (期望 1.0), Q(s=0.5)={q2:.4f} "
-          f"(期望 {0.5 ** 0.25:.4f}), Q(κ=0)={q3:.4f} (期望 Q_min=0.05)")
+    print(f"[ok] quality_score: Q(all ones)={q1:.4f} (expect 1.0), Q(s=0.5)={q2:.4f} "
+          f"(expect {0.5 ** 0.25:.4f}), Q(kappa=0)={q3:.4f} (expect Q_min=0.05)")
     ok &= abs(q1 - 1.0) < 1e-12 and abs(q2 - 0.5 ** 0.25) < 1e-12 and abs(q3 - 0.05) < 1e-12
 
-    # 3) 权重：退化性 / 下限 / 归一化
+    # 3) weights: degeneracy / floor / normalisation
     states = {c: ClientEvalState() for c in range(4)}
     entries = [dict(cid=c, A=1.0, Q=1.0, C=1.0, n=n) for c, n in zip(range(4), [100, 50, 25, 25])]
     a_deg = sparse_aware_weights(entries, states, floor=0.0, momentum=0.0)
     expect = np.array([100, 50, 25, 25], dtype=float)
     expect = expect / expect.sum()
     got = np.array([a_deg[c] for c in range(4)])
-    print(f"[ok] 退化性（floor=0, mom=0）: α={np.round(got, 4).tolist()} vs FedAvg 权重 {np.round(expect, 4).tolist()}"
-          f" | max|Δ|={float(np.abs(got - expect).max()):.2e}")
+    print(f"[ok] degeneracy (floor=0, mom=0): alpha={np.round(got, 4).tolist()} "
+          f"vs FedAvg weights {np.round(expect, 4).tolist()}"
+          f" | max|delta|={float(np.abs(got - expect).max()):.2e}")
     ok &= bool(np.allclose(got, expect, atol=1e-12))
 
     states2 = {c: ClientEvalState() for c in range(4)}
     entries2 = [dict(cid=c, A=0.01, Q=1.0, C=1.0, n=1000) for c in range(4)]
     a_floor = sparse_aware_weights(entries2, states2, floor=0.2, momentum=0.0)
     v = np.array([a_floor[c] for c in range(4)])
-    print(f"[ok] 权重下限: min α={v.min():.4f} ≥ ω/K={0.2 / 4:.4f}，Σα={v.sum():.6f}")
+    print(f"[ok] weight floor: min alpha={v.min():.4f} >= omega/K={0.2 / 4:.4f}, sum alpha={v.sum():.6f}")
     ok &= bool(v.min() >= 0.2 / 4 - 1e-12) and abs(v.sum() - 1.0) < 1e-12
 
-    # 4) 贡献度归一化截断
+    # 4) contribution normalisation and clipping
     cs = ContributionScore()
     for _ in range(30):
         cs.observe("good", 1.0, 0.5)
         cs.observe("bad", 1.0, 1.05)
     norm = cs.normalized(["good", "bad"])
-    print(f"[ok] 贡献度: good={norm['good']:.3f} (上限 1.5), bad={norm['bad']:.3f} (下限 0.5)")
+    print(f"[ok] contribution: good={norm['good']:.3f} (cap 1.5), bad={norm['bad']:.3f} (floor 0.5)")
     ok &= norm["good"] <= 1.5 + 1e-12 and norm["bad"] >= 0.5 - 1e-12
 
     print("[ALL OK]" if ok else "[SOME CHECKS FAILED]")

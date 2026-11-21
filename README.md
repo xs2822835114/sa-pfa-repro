@@ -201,7 +201,7 @@ Every run writes `config.json`, `history.csv`, `final_metrics.json` and a
 * `results/baselines/` contains the runs referenced by the manuscript. Archived
   window-level baselines (Table 1) are not shipped; they can be regenerated with
   the legacy partition as described in Section 3.
-* Code licence and the public repository DOI will be added by the authors.
+* Released under the MIT License; see `LICENSE`.
   Repository URL: <https://github.com/xs2822835114/sa-pfa-repro>.
 
 ---

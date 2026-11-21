@@ -1,1 +1,1 @@
-"""联邦学习代码包（第 3 阶段 Baseline）。"""
+"""Federated learning package: baselines, SA-PFA and shared training primitives."""

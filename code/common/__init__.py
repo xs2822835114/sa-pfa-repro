@@ -1,1 +1,1 @@
-"""公共工具包：数据读取、指标、模型与实验记录（各周复用）。"""
+"""Shared utilities: experiment bookkeeping helpers used across the code base."""

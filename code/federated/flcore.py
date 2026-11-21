@@ -1,9 +1,9 @@
-"""联邦学习核心组件（第 6 周 · T008）。
+"""Federated learning core: model, local training, evaluation, FedAvg aggregation.
 
-包含：模型定义、本地训练、评估、FedAvg 加权聚合。
-聚合公式（计划原文）：
-    w^{t+1} = Σ_{i∈S_t} (n_i / n_{S_t}) · w_i^t
-其中 S_t 为第 t 轮实际参与的客户端集合（稀疏客户端场景下 |S_t| << N）。
+The aggregation rule is
+    w^{t+1} = sum_{i in S_t} (n_i / n_{S_t}) * w_i^t
+where S_t is the set of clients that actually participate in round t (|S_t| << N under
+sparse participation).
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 class MLP(nn.Module):
-    """窗口统计特征分类器（轻量，便于 CPU 上快速跑通联邦闭环）。"""
+    """Window-feature classifier (light enough to run the full federated loop on CPU)."""
 
     def __init__(self, in_dim: int, n_classes: int = 3, hidden=(64, 32), dropout: float = 0.2):
         super().__init__()
@@ -43,18 +43,21 @@ def train_local(global_model: nn.Module, X: torch.Tensor, y: torch.Tensor,
                 weight_decay: float = 1e-4, seed: int = 0,
                 prox_mu: float = 0.0, prox_skip_prefix: str | None = None,
                 sample_weights: torch.Tensor | None = None) -> tuple[nn.Module, int, float]:
-    """客户端本地训练：从全局参数出发做 K 个 epoch 优化，返回 (本地模型, 样本数, 平均损失)。
+    """Client-side training: start from the global parameters, run K epochs, return
+    (local model, sample count, mean loss).
 
-    prox_mu > 0 时（FedProx）目标为 L_i(w) + (μ/2)·‖w − w^t‖²：
-    在每一步对参数与初始化参数（即下发的 w^t）的平方距离做惩罚，抑制本地漂移。
-    prox_skip_prefix 非空时，名字以该前缀开头的参数（例如个性化头 net.5.）不计入 prox 项
-    —— SA-PFA 的设计要求：prox 只约束共享 backbone，个性化头自由更新。
-    sample_weights 非空时按样本加权交叉熵（用于行程等权训练），默认 None 与原行为完全一致。
+    With prox_mu > 0 (FedProx) the objective is L_i(w) + (mu/2)*||w - w^t||^2: every step
+    penalises the squared distance to the received parameters (w^t), limiting local drift.
+    With prox_skip_prefix set, parameters whose name starts with that prefix (e.g. the
+    personalised head net.5.) are excluded from the prox term, so only the shared backbone is
+    constrained and the head adapts freely.
+    With sample_weights set the cross-entropy is sample-weighted (equal weight per trip);
+    None keeps the original behaviour.
     """
     torch.manual_seed(seed)
     model = copy.deepcopy(global_model)
     model.train()
-    ref_params = [(name, p.detach().clone()) for name, p in model.named_parameters()]  # 下发的 w^t（prox 锚点）
+    ref_params = [(name, p.detach().clone()) for name, p in model.named_parameters()]  # received w^t (prox anchor)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     n = len(X)
     bs = max(1, min(batch_size, n))
@@ -97,10 +100,11 @@ def train_local_scope(global_model: nn.Module, X: torch.Tensor, y: torch.Tensor,
                       scope: str = "head", head_prefix: str = "net.5.",
                       epochs: int = 1, lr: float = 1e-2, batch_size: int = 64,
                       weight_decay: float = 1e-4, seed: int = 0):
-    """只更新一部分参数（FedRep）：scope='head' 只训练个性化头，'body' 只训练 backbone。
+    """Update only part of the parameters (FedRep): scope='head' trains the personalised head
+    only, 'body' trains the backbone only.
 
-    与 train_local 相同的优化器/批大小/损失；差别只是 requires_grad 的筛选。
-    返回 (本地模型, 样本数, 平均损失)。
+    Same optimiser, batch size and loss as train_local; only the requires_grad mask differs.
+    Returns (local model, sample count, mean loss).
     """
     torch.manual_seed(seed)
     model = copy.deepcopy(global_model)
@@ -147,7 +151,7 @@ def evaluate(model: nn.Module, X: torch.Tensor, y: torch.Tensor, n_classes: int 
 
 
 def fedavg_aggregate(state_dicts: Sequence[OrderedDict], weights: Sequence[float]) -> OrderedDict:
-    """FedAvg 加权聚合：w = Σ (n_i / Σn_j) · w_i（先升 float64 再还原 dtype）。"""
+    """Weighted FedAvg aggregation: w = sum_i (n_i / sum_j n_j) * w_i (float64, then back to dtype)."""
     wsum = float(sum(weights))
     assert wsum > 0
     agg = OrderedDict()
@@ -158,12 +162,13 @@ def fedavg_aggregate(state_dicts: Sequence[OrderedDict], weights: Sequence[float
 
 
 def state_bytes(state: Dict[str, torch.Tensor]) -> int:
-    """模型参数字节数（float32 = 4 bytes/参数），用于通信量统计。"""
+    """Number of model-parameter bytes (float32 = 4 bytes per parameter), used for communication cost."""
     return int(sum(p.numel() for p in state.values()) * 4)
 
 
 def standardize(train_X: np.ndarray, others: List[np.ndarray]):
-    """按训练集统计量标准化特征（集中预处理，正式版改为客户端本地标准化）。"""
+    """Standardise features with training-set statistics (centralised here for speed; a
+    deployment would standardise locally on each client)."""
     mean = train_X.mean(axis=0)
     std = train_X.std(axis=0)
     std[std < 1e-8] = 1.0
